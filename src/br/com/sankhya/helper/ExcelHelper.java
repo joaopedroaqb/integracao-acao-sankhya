@@ -3,33 +3,40 @@ package br.com.sankhya.helper;
 import br.com.sankhya.contants.ExcelMap;
 import br.com.sankhya.utils.ArquivoUtils;
 import com.sankhya.util.TimeUtils;
+import org.apache.poi.hssf.usermodel.HSSFRow;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFRow;
+import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.*;
 
 /**
  * Lê a primeira planilha e devolve registros como Map<campoVO, valor>.
- * - Casa por NOME do cabeçalho (aliases), em qualquer ordem.
- * - Converte tipos (N, D, DT, S). DT é Timestamp, mas as datas serão removidas no service.
- * - Anota a linha de origem com "_ROW" (1-based).
+ * - Casa por nome do cabeçalho (aliases) em qualquer ordem.
+ * - Converte tipos (N=int, D=decimal, DT=Timestamp, S=string).
+ * - Marca a origem com "_ROW" (1-based).
+ * - IGNORA linhas ocultas (zeroHeight/hidden) se habilitado.
+ * - NÃO interpreta critérios do AutoFilter (sem dependência ooxml-schemas).
  */
 public class ExcelHelper {
 
+    /** Ignorar linhas ocultas (ocultadas manualmente/AutoFilter visual). */
+    private static final boolean IMPORTAR_APENAS_LINHAS_VISIVEIS = true;
+
     public static List<Map<String, Object>> processarArquivo(InputStream file) throws Exception {
         byte[] all = toBytes(file);
-        try {
+        try { // .xls
             return decode(new HSSFWorkbook(new ByteArrayInputStream(all)));
-        } catch (Exception e1) {
-            try {
-                return decode(new XSSFWorkbook(new ByteArrayInputStream(all)));
-            } catch (Exception e2) {
-                throw new Exception("Erro ao abrir Excel: " + e2.getMessage(), e2);
-            }
+        } catch (Exception e1) { // .xlsx
+            return decode(new XSSFWorkbook(new ByteArrayInputStream(all)));
         }
     }
 
@@ -55,7 +62,7 @@ public class ExcelHelper {
             if (!name.isEmpty()) idxExcel.put(name, c);
         }
 
-        // campoVO -> índice da coluna no Excel
+        // campoVO -> índice da coluna no Excel (por alias)
         Map<String, String> aliases = ExcelMap.aliases();
         Map<String, Integer> voToIdx = new LinkedHashMap<>();
         for (Map.Entry<String, String> e : aliases.entrySet()) {
@@ -71,6 +78,9 @@ public class ExcelHelper {
         for (int r = 1; r <= sheet.getLastRowNum(); r++) {
             Row row = sheet.getRow(r);
             if (row == null) continue;
+
+            // Respeita visibilidade (sem CT*)
+            if (IMPORTAR_APENAS_LINHAS_VISIVEIS && isRowHidden(sheet, row)) continue;
 
             Map<String, Object> registro = new LinkedHashMap<>();
             boolean vazio = true;
@@ -96,32 +106,13 @@ public class ExcelHelper {
         return out;
     }
 
-    private static Object converter(Cell cell, String tipo) throws Exception {
-        if (cell == null) return null;
-
-        String raw = ArquivoUtils.formatarCelulaComoString(cell, 6);
-        if (raw == null) return null;
-        raw = raw.trim();
-        if (raw.isEmpty()) return null;
-
-        // "nulos" comuns
-        String rawNorm = raw.replaceAll("[\\s\\-–—_]+", "");
-        if (rawNorm.equalsIgnoreCase("null") || rawNorm.equalsIgnoreCase("na") || rawNorm.equalsIgnoreCase("n/a")) {
-            return null;
-        }
-
-        if ("N".equals(tipo)) { // inteiro
-            return new BigDecimal(raw.replace(",", ".")).setScale(0, BigDecimal.ROUND_HALF_UP);
-        }
-        if ("D".equals(tipo)) { // decimal
-            return new BigDecimal(raw.replace(",", ".")).setScale(6, BigDecimal.ROUND_HALF_UP);
-        }
-        if ("DT".equals(tipo)) { // Timestamp (se formatado; o service remove de qualquer forma)
-            if (!raw.matches("\\d{1,2}/\\d{1,2}/\\d{4}")) return null;
-            if ("00/00/0000".equals(raw)) return null;
-            return TimeUtils.toTimestamp(raw, "dd/MM/yyyy");
-        }
-        return raw; // string
+    // ---------- utilitários ----------
+    private static boolean isRowHidden(Sheet sheet, Row row) {
+        boolean hidden = false;
+        try { hidden = row.getZeroHeight(); } catch (Exception ignore) {}
+        try { if (row instanceof XSSFRow) hidden = hidden || ((XSSFRow) row).getCTRow().getHidden(); } catch (Exception ignore) {}
+        try { if (row instanceof HSSFRow) hidden = hidden || ((HSSFRow) row).getZeroHeight(); } catch (Exception ignore) {}
+        return hidden;
     }
 
     private static String normalize(String s) {
@@ -131,5 +122,33 @@ public class ExcelHelper {
         s = s.replaceAll("\\p{InCombiningDiacriticalMarks}+", "");
         s = s.replace(".", "").replace("  ", " ");
         return s;
+    }
+
+    private static Object converter(Cell cell, String tipo) throws Exception {
+        if (cell == null) return null;
+
+        String raw = ArquivoUtils.formatarCelulaComoString(cell, 6);
+        if (raw == null) return null;
+        raw = raw.trim();
+        if (raw.isEmpty()) return null;
+
+        // “nulos” comuns
+        String rawNorm = raw.replaceAll("[\\s\\-–—_]+", "");
+        if (rawNorm.equalsIgnoreCase("null") || rawNorm.equalsIgnoreCase("na") || rawNorm.equalsIgnoreCase("n/a")) {
+            return null;
+        }
+
+        if ("N".equals(tipo)) { // inteiro
+            return new BigDecimal(raw.replace(",", ".")).setScale(0, RoundingMode.HALF_UP);
+        }
+        if ("D".equals(tipo)) { // decimal
+            return new BigDecimal(raw.replace(",", ".")).setScale(6, RoundingMode.HALF_UP);
+        }
+        if ("DT".equals(tipo)) { // Timestamp (service remove depois, se necessário)
+            if (!raw.matches("\\d{1,2}/\\d{1,2}/\\d{4}")) return null;
+            if ("00/00/0000".equals(raw)) return null;
+            return com.sankhya.util.TimeUtils.toTimestamp(raw, "dd/MM/yyyy");
+        }
+        return raw; // texto
     }
 }
